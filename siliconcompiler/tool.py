@@ -1,4 +1,5 @@
 import contextlib
+import logging
 import os
 import psutil
 import re
@@ -32,8 +33,7 @@ from siliconcompiler import utils
 from siliconcompiler import sc_open
 
 from siliconcompiler.record import RecordTool
-
-from siliconcompiler.scheduler import print_traceback
+from siliconcompiler.flowgraph import RuntimeFlowgraph
 
 
 class TaskError(Exception):
@@ -93,7 +93,7 @@ class ToolSchema(NamedSchema):
 
         self.set_runtime(None)
 
-    def set_runtime(self, chip):
+    def set_runtime(self, chip, step=None, index=None):
         '''
         Sets the runtime information needed to properly execute a task.
         Note: unstable API
@@ -109,19 +109,22 @@ class ToolSchema(NamedSchema):
             self.__schema_full = chip.schema
             self.__logger = chip.logger
 
-        self.__step = None
-        self.__index = None
+        self.__step = step
+        self.__index = index
         self.__tool = None
         self.__task = None
 
         self.__schema_record = None
         self.__schema_metric = None
+        self.__schema_flow = None
         if self.__schema_full:
             self.__schema_record = self.__schema_full.get("record", field="schema")
             self.__schema_metric = self.__schema_full.get("metric", field="schema")
 
-            self.__step = self.__schema_full.get('arg', 'step')
-            self.__index = self.__schema_full.get('arg', 'index')
+            if not self.__step:
+                self.__step = self.__schema_full.get('arg', 'step')
+            if not self.__index:
+                self.__index = self.__schema_full.get('arg', 'index')
 
             if not self.__step or not self.__index:
                 raise RuntimeError("step or index not specified")
@@ -129,10 +132,9 @@ class ToolSchema(NamedSchema):
             flow = self.__schema_full.get('option', 'flow')
             if not flow:
                 raise RuntimeError("flow not specified")
-            self.__tool = self.__schema_full.get(
-                'flowgraph', flow, self.__step, self.__index, 'tool')
-            self.__task = self.__schema_full.get(
-                'flowgraph', flow, self.__step, self.__index, 'task')
+            self.__schema_flow = self.__schema_full.get("flowgraph", flow, field="schema")
+            self.__tool = self.__schema_flow.get(self.__step, self.__index, 'tool')
+            self.__task = self.__schema_flow.get(self.__step, self.__index, 'task')
 
     def node(self):
         '''
@@ -173,6 +175,8 @@ class ToolSchema(NamedSchema):
             return self.__schema_record
         elif type == "metric":
             return self.__schema_metric
+        elif type == "flow":
+            return self.__schema_flow
         else:
             raise ValueError(f"{type} is not a schema section")
 
@@ -625,8 +629,7 @@ class ToolSchema(NamedSchema):
                         retcode = self.run()
             except Exception as e:
                 self.__logger.error(f'Failed in run() for {self.name()}/{self.__task}: {e}')
-                retcode = 1  # default to non-zero
-                print_traceback(self.__chip, e)
+                utils.print_traceback(self.__logger, e)
                 raise e
             finally:
                 with sc_open(stdout_file) as stdout_reader, \
@@ -774,6 +777,7 @@ class ToolSchema(NamedSchema):
         for key in list(state.keys()):
             if key.startswith("_ToolSchema__"):
                 del state[key]
+
         return state
 
     def __setstate__(self, state):
@@ -781,6 +785,9 @@ class ToolSchema(NamedSchema):
 
         # Reinit runtime information
         self.set_runtime(None)
+
+    def get_output_files(self):
+        return set(self.get("task", self.__task, "output", step=self.__step, index=self.__index))
 
     ###############################################################
     def parse_version(self, stdout):
@@ -791,6 +798,15 @@ class ToolSchema(NamedSchema):
 
     def setup(self):
         pass
+
+    def select_input_nodes(self):
+        flow = self.schema("flow")
+        runtime = RuntimeFlowgraph(
+            flow,
+            from_steps=set([step for step, _ in flow.get_entry_nodes()]),
+            prune_nodes=self.__chip.get('option', 'prune'))
+
+        return runtime.get_node_inputs(self.__step, self.__index, record=self.schema("record"))
 
     def pre_process(self):
         pass
@@ -803,6 +819,98 @@ class ToolSchema(NamedSchema):
 
     def post_process(self):
         pass
+
+
+###########################################################################
+# Migration helper
+###########################################################################
+class ToolSchemaTmp(ToolSchema):
+    def __module_func(self, name, modules):
+        for module in modules:
+            method = getattr(module, name, None)
+            if method:
+                return method
+        return None
+
+    def __tool_task_modules(self):
+        step, index = self.node()
+        flow = self._ToolSchema__chip.get('option', 'flow')
+        return \
+            self._ToolSchema__chip._get_tool_module(step, index, flow=flow), \
+            self._ToolSchema__chip._get_task_module(step, index, flow=flow)
+
+    def get_output_files(self):
+        _, task = self.__tool_task_modules()
+        method = self.__module_func("_gather_outputs", [task])
+        if method:
+            return method(self._ToolSchema__chip, *self.node())
+        return ToolSchema.get_output_files(self)
+
+    def parse_version(self, stdout):
+        tool, _ = self.__tool_task_modules()
+        method = self.__module_func("parse_version", [tool])
+        if method:
+            return method(stdout)
+        return ToolSchema.parse_version(self, stdout)
+
+    def normalize_version(self, version):
+        tool, _ = self.__tool_task_modules()
+        method = self.__module_func("normalize_version", [tool])
+        if method:
+            return method(version)
+        return ToolSchema.normalize_version(self, version)
+
+    def setup(self):
+        _, task = self.__tool_task_modules()
+        method = self.__module_func("setup", [task])
+        if method:
+            return method(self._ToolSchema__chip)
+        return ToolSchema.setup(self)
+
+    def select_input_nodes(self):
+        _, task = self.__tool_task_modules()
+        method = self.__module_func("_select_inputs", [task])
+        if method:
+            return method(self._ToolSchema__chip, *self.node())
+        return ToolSchema.select_input_nodes(self)
+
+    def pre_process(self):
+        _, task = self.__tool_task_modules()
+        method = self.__module_func("pre_process", [task])
+        if method:
+            return method(self._ToolSchema__chip)
+        return ToolSchema.pre_process(self)
+
+    def runtime_options(self):
+        tool, task = self.__tool_task_modules()
+        method = self.__module_func("runtime_options", [task, tool])
+        if method:
+            return method(self._ToolSchema__chip)
+        return ToolSchema.runtime_options(self)
+
+    def run(self):
+        _, task = self.__tool_task_modules()
+        method = self.__module_func("run", [task])
+        if method:
+            # Handle logger stdout suppression if quiet
+            step, index = self.node()
+            stdout_handler_level = self._ToolSchema__chip.logger._console.level
+            if self._ToolSchema__chip.get('option', 'quiet', step=step, index=index):
+                self._ToolSchema__chip.logger._console.setLevel(logging.CRITICAL)
+
+            retcode = method(self._ToolSchema__chip)
+
+            self._ToolSchema__chip.logger._console.setLevel(stdout_handler_level)
+
+            return retcode
+        return ToolSchema.run(self)
+
+    def post_process(self):
+        _, task = self.__tool_task_modules()
+        method = self.__module_func("post_process", [task])
+        if method:
+            return method(self._ToolSchema__chip)
+        return ToolSchema.post_process(self)
 
 
 ###########################################################################

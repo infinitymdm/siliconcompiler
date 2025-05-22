@@ -1,66 +1,26 @@
-import contextlib
-import multiprocessing
 import logging
 import os
-import psutil
 import re
-import shlex
 import shutil
-import subprocess
 import sys
-import time
-import packaging.version
-import packaging.specifiers
-from io import StringIO
-import traceback
-from logging.handlers import QueueHandler, QueueListener
+from logging.handlers import QueueHandler
 from siliconcompiler import sc_open
 from siliconcompiler import utils
 from siliconcompiler.remote import Client
 from siliconcompiler import Schema
 from siliconcompiler.schema import JournalingSchema
 from siliconcompiler.record import RecordTime, RecordTool
-from siliconcompiler.scheduler import slurm
-from siliconcompiler.scheduler import docker_runner
 from siliconcompiler import NodeStatus, SiliconCompilerError
-from siliconcompiler.utils.flowgraph import _check_flowgraph
-from siliconcompiler.utils.logging import SCBlankLoggerFormatter
 from siliconcompiler.tools._common import input_file_node_name
 import lambdapdk
 from siliconcompiler.tools._common import get_tool_task, record_metric
 from siliconcompiler.scheduler import send_messages
 from siliconcompiler.flowgraph import RuntimeFlowgraph
-
-try:
-    import resource
-except ModuleNotFoundError:
-    resource = None
-
-
-# callback hooks to help custom runners track progress
-_callback_funcs = {}
-
-
-def register_callback(hook, func):
-    _callback_funcs[hook] = func
-
-
-def _get_callback(hook):
-    if hook in _callback_funcs:
-        return _callback_funcs[hook]
-    return None
+from siliconcompiler.scheduler.taskscheduler import TaskScheduler
 
 
 # Max lines to print from failed node log
 _failed_log_lines = 20
-
-
-#######################################
-def _do_record_access():
-    '''
-    Determine if Schema should record calls to .get
-    '''
-    return False
 
 
 ###############################################################################
@@ -95,7 +55,16 @@ def run(chip):
 
     # Check if flowgraph is complete and valid
     flow = chip.get('option', 'flow')
-    if not _check_flowgraph(chip, flow=flow):
+    if not chip.schema.get("flowgraph", flow, field="schema").validate(logger=chip.logger):
+        raise SiliconCompilerError(
+            f"{flow} flowgraph contains errors and cannot be run.",
+            chip=chip)
+    if not RuntimeFlowgraph.validate(
+            chip.schema.get("flowgraph", flow, field="schema"),
+            from_steps=chip.get('option', 'from'),
+            to_steps=chip.get('option', 'to'),
+            prune_nodes=chip.get('option', 'prune'),
+            logger=chip.logger):
         raise SiliconCompilerError(
             f"{flow} flowgraph contains errors and cannot be run.",
             chip=chip)
@@ -294,39 +263,10 @@ def _local_process(chip, flow):
             'Implementation errors encountered. See previous errors.',
             chip=chip)
 
-    nodes_to_run = {}
-    processes = {}
-    local_processes = []
-    log_queue = _prepare_nodes(chip, nodes_to_run, processes, local_processes, flow)
-
-    # Handle logs across threads
-    log_listener = QueueListener(log_queue, chip.logger._console)
-    chip.logger._console.setFormatter(SCBlankLoggerFormatter())
-    log_listener.start()
-
-    # Update dashboard before run begins
-    if chip._dash:
-        chip._dash.update_manifest()
-
-    try:
-        _launch_nodes(chip, nodes_to_run, processes, local_processes)
-    except KeyboardInterrupt:
-        # exit immediately
-        log_listener.stop()
-        sys.exit(0)
-
-    if _get_callback('post_run'):
-        _get_callback('post_run')(chip)
+    task_scheduler = TaskScheduler(chip)
+    task_scheduler.run()
 
     _check_nodes_status(chip, flow)
-
-    # Cleanup logger
-    log_listener.stop()
-    chip._init_logger_formats()
-
-
-def __is_posix():
-    return sys.platform != 'win32'
 
 
 ###########################################################################
@@ -342,21 +282,19 @@ def _setup_node(chip, step, index, flow=None):
     chip.set('arg', 'index', index)
     tool, task = get_tool_task(chip, step, index, flow=flow)
 
+    task_class = chip.get("tool", tool, field="schema")
+    task_class.set_runtime(chip)
+
     # Run node setup.
+    chip.logger.info(f'Setting up node {step}{index} with {tool}/{task}')
     setup_ret = None
     try:
-        setup_step = getattr(chip._get_task_module(step, index), 'setup', None)
-    except SiliconCompilerError:
-        setup_step = None
-    if setup_step:
-        try:
-            chip.logger.info(f'Setting up node {step}{index} with {tool}/{task}')
-            setup_ret = setup_step(chip)
-        except Exception as e:
-            chip.logger.error(f'Failed to run setup() for {tool}/{task}')
-            raise e
-    else:
-        raise SiliconCompilerError(f'setup() not found for tool {tool}, task {task}', chip=chip)
+        setup_ret = task_class.setup()
+    except Exception as e:
+        chip.logger.error(f'Failed to run setup() for {tool}/{task}')
+        raise e
+
+    task_class.set_runtime(None)
 
     # Need to restore step/index, otherwise we will skip setting up other indices.
     chip.set('option', 'flow', preset_flow)
@@ -371,86 +309,6 @@ def _setup_node(chip, step, index, flow=None):
         return False
 
     return True
-
-
-def _check_version(chip, reported_version, tool, step, index):
-    # Based on regex for deprecated "legacy specifier" from PyPA packaging
-    # library. Use this to parse PEP-440ish specifiers with arbitrary
-    # versions.
-    _regex_str = r"""
-        (?P<operator>(==|!=|<=|>=|<|>|~=))
-        \s*
-        (?P<version>
-            [^,;\s)]* # Since this is a "legacy" specifier, and the version
-                      # string can be just about anything, we match everything
-                      # except for whitespace, a semi-colon for marker support,
-                      # a closing paren since versions can be enclosed in
-                      # them, and a comma since it's a version separator.
-        )
-        """
-    _regex = re.compile(r"^\s*" + _regex_str + r"\s*$", re.VERBOSE | re.IGNORECASE)
-
-    normalize_version = getattr(chip._get_tool_module(step, index), 'normalize_version', None)
-    # Version is good if it matches any of the specifier sets in this list.
-    spec_sets = chip.get('tool', tool, 'version', step=step, index=index)
-    if not spec_sets:
-        return True
-
-    for spec_set in spec_sets:
-        split_specs = [s.strip() for s in spec_set.split(",") if s.strip()]
-        specs_list = []
-        for spec in split_specs:
-            match = re.match(_regex, spec)
-            if match is None:
-                chip.logger.warning(f'Invalid version specifier {spec}. '
-                                    f'Defaulting to =={spec}.')
-                operator = '=='
-                spec_version = spec
-            else:
-                operator = match.group('operator')
-                spec_version = match.group('version')
-            specs_list.append((operator, spec_version))
-
-        if normalize_version is None:
-            normalized_version = reported_version
-            normalized_specs = ','.join([f'{op}{ver}' for op, ver in specs_list])
-        else:
-            try:
-                normalized_version = normalize_version(reported_version)
-            except Exception as e:
-                chip.logger.error(f'Unable to normalize version for {tool}: {reported_version}')
-                raise e
-            normalized_spec_list = [f'{op}{normalize_version(ver)}' for op, ver in specs_list]
-            normalized_specs = ','.join(normalized_spec_list)
-
-        try:
-            version = packaging.version.Version(normalized_version)
-        except packaging.version.InvalidVersion:
-            chip.logger.error(f'Version {reported_version} reported by {tool} does '
-                              'not match standard.')
-            if normalize_version is None:
-                chip.logger.error('Tool driver should implement normalize_version().')
-            else:
-                chip.logger.error('normalize_version() returned '
-                                  f'invalid version {normalized_version}')
-
-            return False
-
-        try:
-            spec_set = packaging.specifiers.SpecifierSet(normalized_specs)
-        except packaging.specifiers.InvalidSpecifier:
-            chip.logger.error(f'Version specifier set {normalized_specs} '
-                              'does not match standard.')
-            return False
-
-        if version in spec_set:
-            return True
-
-    allowedstr = '; '.join(spec_sets)
-    chip.logger.error(f"Version check failed for {tool}. Check installation.")
-    chip.logger.error(f"Found version {reported_version}, "
-                      f"did not satisfy any version specifier set {allowedstr}.")
-    return False
 
 
 ###########################################################################
@@ -502,7 +360,7 @@ def _runtask(chip, flow, step, index, exec_func, pipe=None, queue=None, replay=F
 
         exec_func(chip, step, index, replay)
     except Exception as e:
-        print_traceback(chip, e)
+        utils.print_traceback(chip.logger, e)
         _haltstep(chip, chip.get('option', 'flow'), step, index)
 
     # return to original directory
@@ -545,20 +403,6 @@ def _setupnode(chip, flow, step, index, replay):
 
 
 ###########################################################################
-def _write_task_manifest(chip, tool, path=None, backup=True):
-    suffix = chip.get('tool', tool, 'format')
-    if suffix:
-        manifest_path = f"sc_manifest.{suffix}"
-        if path:
-            manifest_path = os.path.join(path, manifest_path)
-
-        if backup and os.path.exists(manifest_path):
-            shutil.copyfile(manifest_path, f'{manifest_path}.bak')
-
-        chip.write_manifest(manifest_path, abspath=True)
-
-
-###########################################################################
 def _setup_workdir(chip, step, index, replay):
     workdir = chip.getworkdir(step=step, index=index)
 
@@ -575,27 +419,18 @@ def _select_inputs(chip, step, index, trial=False):
 
     flow = chip.get('option', 'flow')
     tool, _ = get_tool_task(chip, step, index, flow)
-    sel_inputs = []
 
-    select_inputs = getattr(chip._get_task_module(step, index, flow=flow),
-                            '_select_inputs',
-                            None)
-    if select_inputs:
-        log_level = chip.logger.level
-        if trial:
-            chip.logger.setLevel(logging.CRITICAL)
-        sel_inputs = select_inputs(chip, step, index)
-        if trial:
-            chip.logger.setLevel(log_level)
-    else:
-        flow_schema = chip.schema.get("flowgraph", flow, field="schema")
-        runtime = RuntimeFlowgraph(
-            flow_schema,
-            from_steps=set([step for step, _ in flow_schema.get_entry_nodes()]),
-            prune_nodes=chip.get('option', 'prune'))
+    task_class = chip.get("tool", tool, field="schema")
+    task_class.set_runtime(chip, step=step, index=index)
 
-        sel_inputs = runtime.get_node_inputs(step, index,
-                                             record=chip.schema.get("record", field="schema"))
+    log_level = chip.logger.level
+    if trial:
+        chip.logger.setLevel(logging.CRITICAL)
+
+    sel_inputs = task_class.select_input_nodes()
+
+    if trial:
+        chip.logger.setLevel(log_level)
 
     if (step, index) not in chip.schema.get("flowgraph", flow, field="schema").get_entry_nodes() \
             and not sel_inputs:
@@ -683,414 +518,9 @@ def _copy_previous_steps_output_data(chip, step, index, replay):
                     os.rename(f'inputs/{outfile.name}', f'inputs/{new_name}')
 
 
-def __read_std_streams(chip, quiet,
-                       is_stdout_log, stdout_reader, stdout_print,
-                       is_stderr_log, stderr_reader, stderr_print):
-    '''
-    Handle directing tool outputs to logger
-    '''
-    if not quiet:
-        if is_stdout_log:
-            for line in stdout_reader.readlines():
-                stdout_print(line.rstrip())
-        if is_stderr_log:
-            for line in stderr_reader.readlines():
-                stderr_print(line.rstrip())
-
-
 ############################################################################
 # Chip helper Functions
 ############################################################################
-def _getexe(chip, tool, step, index):
-    exe = chip.get('tool', tool, 'exe')
-    if exe is None:
-        return None
-    path = chip.find_files('tool', tool, 'path', step=step, index=index)
-
-    syspath = os.getenv('PATH', os.defpath)
-    if path:
-        # Prepend 'path' schema var to system path
-        syspath = path + os.pathsep + syspath
-
-    fullexe = shutil.which(exe, path=syspath)
-
-    return fullexe
-
-
-def _get_run_env_vars(chip, tool, task, step, index, include_path):
-    envvars = utils.get_env_vars(chip, step, index)
-    for item in chip.getkeys('tool', tool, 'licenseserver'):
-        license_file = chip.get('tool', tool, 'licenseserver', item, step=step, index=index)
-        if license_file:
-            envvars[item] = ':'.join(license_file)
-
-    if include_path:
-        path = chip.get('tool', tool, 'path', step=step, index=index)
-        if path:
-            envvars['PATH'] = path + os.pathsep + os.environ['PATH']
-        else:
-            envvars['PATH'] = os.environ['PATH']
-
-        # Forward additional variables
-        for var in ('LD_LIBRARY_PATH',):
-            val = os.getenv(var, None)
-            if val:
-                envvars[var] = val
-
-    return envvars
-
-
-#######################################
-def _makecmd(chip, tool, task, step, index, script_name='replay.sh', include_path=True):
-    '''
-    Constructs a subprocess run command based on eda tool setup.
-    Creates a replay script in current directory.
-
-    Returns:
-        runnable command (list)
-        printable command (str)
-        command name (str)
-        command arguments (list)
-    '''
-
-    fullexe = _getexe(chip, tool, step, index)
-
-    def parse_options(options):
-        if not options:
-            return []
-        shlex_opts = []
-        for option in options:
-            shlex_opts.append(str(option).strip())
-        return shlex_opts
-
-    # Add scripts files
-    scripts = chip.find_files('tool', tool, 'task', task, 'script', step=step, index=index)
-
-    cmdlist = [fullexe]
-    cmdlist.extend(parse_options(chip.get('tool', tool, 'task', task, 'option',
-                                          step=step, index=index)))
-    cmdlist.extend(scripts)
-
-    runtime_options = getattr(chip._get_task_module(step, index), 'runtime_options', None)
-    if not runtime_options:
-        runtime_options = getattr(chip._get_tool_module(step, index), 'runtime_options', None)
-    if runtime_options:
-        try:
-            if _do_record_access():
-                chip.schema.add_journaling_type("get")
-            cmdlist.extend(parse_options(runtime_options(chip)))
-            chip.schema.remove_journaling_type("get")
-        except Exception as e:
-            chip.logger.error(f'Failed to get runtime options for {tool}/{task}')
-            raise e
-
-    # Separate variables to be able to display nice name of executable
-    cmd = os.path.basename(cmdlist[0])
-    cmd_args = cmdlist[1:]
-    print_cmd = shlex.join([cmd, *cmd_args])
-
-    # create replay file
-    with open(script_name, 'w') as f:
-        # Ensure execution runs from the same directory
-        replay_opts = {}
-        work_dir = chip.getworkdir(step=step, index=index)
-        if chip._relative_path:
-            work_dir = os.path.relpath(work_dir, chip._relative_path)
-        replay_opts["work_dir"] = work_dir
-        replay_opts["exports"] = _get_run_env_vars(chip,
-                                                   tool, task,
-                                                   step, index,
-                                                   include_path=include_path)
-        replay_opts["executable"] = chip.get('tool', tool, 'exe')
-
-        vswitch = chip.get('tool', tool, 'vswitch')
-        if vswitch:
-            replay_opts["version_flag"] = " ".join(vswitch)
-
-        format_cmd = [replay_opts["executable"]]
-        arg_test = re.compile(r'^[-+]')
-        file_test = re.compile(r'^[/]')
-        for cmdarg in cmd_args:
-            add_new_line = len(format_cmd) == 1
-
-            if arg_test.match(cmdarg) or file_test.match(cmdarg):
-                add_new_line = True
-            else:
-                if not arg_test.match(format_cmd[-1]):
-                    add_new_line = True
-
-            if add_new_line:
-                format_cmd.append(shlex.quote(cmdarg))
-            else:
-                format_cmd[-1] += f' {shlex.quote(cmdarg)}'
-
-        replay_opts["cmds"] = format_cmd
-
-        f.write(utils.get_file_template("replay/replay.sh.j2").render(replay_opts))
-        f.write("\n")
-
-    os.chmod(script_name, 0o755)
-
-    return cmdlist, print_cmd, cmd, cmd_args
-
-
-def __get_stdio(chip, tool, task, flow, step, index):
-    def get_file(io_type):
-        suffix = chip.get('tool', tool, 'task', task, io_type, 'suffix',
-                          step=step, index=index)
-        destination = chip.get('tool', tool, 'task', task, io_type, 'destination',
-                               step=step, index=index)
-
-        io_file = None
-        if destination == 'log':
-            io_file = step + "." + suffix
-        elif destination == 'output':
-            io_file = os.path.join('outputs', chip.top() + "." + suffix)
-        elif destination == 'none':
-            io_file = os.devnull
-        else:
-            # This should not happen
-            chip.logger.error(f'{io_type}/destination has no support for {destination}.')
-            _haltstep(chip, flow, step, index)
-
-        return io_file
-
-    stdout_file = get_file('stdout')
-    stderr_file = get_file('stderr')
-
-    return stdout_file, stderr_file
-
-
-def _run_executable_or_builtin(chip, step, index, version, toolpath, workdir, run_func=None):
-    '''
-    Run executable (or copy inputs to outputs for builtin functions)
-    '''
-
-    flow = chip.get('option', 'flow')
-    tool, task = get_tool_task(chip, step, index, flow)
-
-    quiet = (
-        chip.get('option', 'quiet', step=step, index=index) and
-        not chip.get('option', 'breakpoint', step=step, index=index)
-    )
-
-    stdout_print = chip.logger.info
-    stderr_print = chip.logger.error
-    if chip.get('option', 'loglevel', step=step, index=index) == "quiet":
-        stdout_print = chip.logger.error
-        stderr_print = chip.logger.error
-
-    # TODO: Currently no memory usage tracking in breakpoints, builtins, or unexpected errors.
-    max_mem_bytes = 0
-    cpu_start = time.time()
-
-    stdout_file, stderr_file = __get_stdio(chip, tool, task, flow, step, index)
-    is_stdout_log = chip.get('tool', tool, 'task', task, 'stdout', 'destination',
-                             step=step, index=index) == 'log'
-    is_stderr_log = chip.get('tool', tool, 'task', task, 'stderr', 'destination',
-                             step=step, index=index) == 'log' and stderr_file != stdout_file
-
-    chip.logger.info(f'Running in {workdir}')
-
-    retcode = 0
-    cmdlist = []
-    cmd_args = []
-    if run_func:
-        logfile = None
-        try:
-            with open(stdout_file, 'w') as stdout_writer, \
-                    open(stderr_file, 'w') as stderr_writer:
-                if stderr_file == stdout_file:
-                    stderr_writer.close()
-                    stderr_writer = sys.stdout
-
-                # Handle logger stdout suppression if quiet
-                stdout_handler_level = chip.logger._console.level
-                if chip.get('option', 'quiet', step=step, index=index):
-                    chip.logger._console.setLevel(logging.CRITICAL)
-
-                with contextlib.redirect_stderr(stderr_writer), \
-                        contextlib.redirect_stdout(stdout_writer):
-                    retcode = run_func(chip)
-
-                chip.logger._console.setLevel(stdout_handler_level)
-        except Exception as e:
-            chip.logger.error(f'Failed in run() for {tool}/{task}: {e}')
-            retcode = 1  # default to non-zero
-            print_traceback(chip, e)
-            chip._error = True
-        finally:
-            with sc_open(stdout_file) as stdout_reader, \
-                    sc_open(stderr_file) as stderr_reader:
-                __read_std_streams(chip,
-                                   quiet,
-                                   is_stdout_log, stdout_reader, stdout_print,
-                                   is_stderr_log, stderr_reader, stderr_print)
-
-            try:
-                if resource:
-                    # Since memory collection is not possible, collect the current process
-                    # peak memory
-                    max_mem_bytes = max(
-                        max_mem_bytes,
-                        1024 * resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
-            except (OSError, ValueError, PermissionError):
-                pass
-    else:
-        cmdlist, printable_cmd, _, cmd_args = _makecmd(chip, tool, task, step, index)
-
-        ##################
-        # Make record of tool options
-        if cmd_args is not None:
-            chip.schema.get("record", field='schema').record_tool(
-                step, index, cmd_args, RecordTool.ARGS)
-
-        chip.logger.info('%s', printable_cmd)
-        timeout = chip.get('option', 'timeout', step=step, index=index)
-        logfile = step + '.log'
-        if sys.platform in ('darwin', 'linux') and \
-           chip.get('option', 'breakpoint', step=step, index=index):
-            # When we break on a step, the tool often drops into a shell.
-            # However, our usual subprocess scheme seems to break terminal
-            # echo for some tools. On POSIX-compatible systems, we can use
-            # pty to connect the tool to our terminal instead. This code
-            # doesn't handle quiet/timeout logic, since we don't want either
-            # of these features for an interactive session. Logic for
-            # forwarding to file based on
-            # https://docs.python.org/3/library/pty.html#example.
-            with open(logfile, 'wb') as log_writer:
-                def read(fd):
-                    data = os.read(fd, 1024)
-                    log_writer.write(data)
-                    return data
-                import pty  # Note: this import throws exception on Windows
-                retcode = pty.spawn(cmdlist, read)
-        else:
-            with open(stdout_file, 'w') as stdout_writer, \
-                    open(stdout_file, 'r', errors='replace_with_warning') as stdout_reader, \
-                    open(stderr_file, 'w') as stderr_writer, \
-                    open(stderr_file, 'r', errors='replace_with_warning') as stderr_reader:
-                # if STDOUT and STDERR are to be redirected to the same file,
-                # use a single writer
-                if stderr_file == stdout_file:
-                    stderr_writer.close()
-                    stderr_reader.close()
-                    stderr_writer = subprocess.STDOUT
-
-                preexec_fn = None
-                nice = None
-                if __is_posix():
-                    nice = chip.get('option', 'nice', step=step, index=index)
-
-                    def set_nice():
-                        os.nice(nice)
-
-                    if nice:
-                        preexec_fn = set_nice
-
-                proc = subprocess.Popen(cmdlist,
-                                        stdin=subprocess.DEVNULL,
-                                        stdout=stdout_writer,
-                                        stderr=stderr_writer,
-                                        preexec_fn=preexec_fn)
-                # How long to wait for proc to quit on ctrl-c before force
-                # terminating.
-                POLL_INTERVAL = 0.1
-                MEMORY_WARN_LIMIT = 90
-                try:
-                    while proc.poll() is None:
-                        # Gather subprocess memory usage.
-                        try:
-                            pproc = psutil.Process(proc.pid)
-                            proc_mem_bytes = pproc.memory_full_info().uss
-                            for child in pproc.children(recursive=True):
-                                proc_mem_bytes += child.memory_full_info().uss
-                            max_mem_bytes = max(max_mem_bytes, proc_mem_bytes)
-
-                            memory_usage = psutil.virtual_memory()
-                            if memory_usage.percent > MEMORY_WARN_LIMIT:
-                                chip.logger.warning(
-                                    f'Current system memory usage is {memory_usage.percent}%')
-
-                                # increase limit warning
-                                MEMORY_WARN_LIMIT = int(memory_usage.percent + 1)
-                        except psutil.Error:
-                            # Process may have already terminated or been killed.
-                            # Retain existing memory usage statistics in this case.
-                            pass
-                        except PermissionError:
-                            # OS is preventing access to this information so it cannot
-                            # be collected
-                            pass
-
-                        # Loop until process terminates
-                        __read_std_streams(chip,
-                                           quiet,
-                                           is_stdout_log, stdout_reader, stdout_print,
-                                           is_stderr_log, stderr_reader, stderr_print)
-
-                        if timeout is not None and time.time() - cpu_start > timeout:
-                            chip.logger.error(f'Step timed out after {timeout} seconds')
-                            utils.terminate_process(proc.pid)
-                            raise SiliconCompilerTimeout(f'{step}{index} timeout')
-                        time.sleep(POLL_INTERVAL)
-                except KeyboardInterrupt:
-                    kill_process(chip, proc, tool, 5 * POLL_INTERVAL, msg="Received ctrl-c. ")
-                    _haltstep(chip, flow, step, index, log=False)
-                except SiliconCompilerTimeout:
-                    send_messages.send(chip, "timeout", step, index)
-                    kill_process(chip, proc, tool, 5 * POLL_INTERVAL)
-                    chip._error = True
-
-                # Read the remaining
-                __read_std_streams(chip,
-                                   quiet,
-                                   is_stdout_log, stdout_reader, stdout_print,
-                                   is_stderr_log, stderr_reader, stderr_print)
-                retcode = proc.returncode
-
-    chip.schema.get("record", field='schema').record_tool(step, index, retcode, RecordTool.EXITCODE)
-    if retcode != 0:
-        msg = f'Command failed with code {retcode}.'
-        if logfile:
-            if quiet:
-                # Print last N lines of log when in quiet mode
-                with sc_open(logfile) as logfd:
-                    loglines = logfd.read().splitlines()
-                    for logline in loglines[-_failed_log_lines:]:
-                        chip.logger.error(logline)
-                # No log file for pure-Python tools.
-            msg += f' See log file {os.path.abspath(logfile)}'
-        chip.logger.warning(msg)
-        chip._error = True
-
-    # Capture cpu runtime
-    record_metric(chip, step, index, 'exetime', round((time.time() - cpu_start), 2),
-                  source=None,
-                  source_unit='s')
-
-    # Capture memory usage
-    record_metric(chip, step, index, 'memory', max_mem_bytes,
-                  source=None,
-                  source_unit='B')
-
-
-def _post_process(chip, step, index):
-    flow = chip.get('option', 'flow')
-    tool, task = get_tool_task(chip, step, index, flow)
-    func = getattr(chip._get_task_module(step, index, flow=flow), 'post_process', None)
-    if func:
-        try:
-            if _do_record_access():
-                chip.schema.add_journaling_type("get")
-            func(chip)
-            chip.schema.remove_journaling_type("get")
-        except Exception as e:
-            chip.logger.error(f'Failed to run post-process for {tool}/{task}.')
-            print_traceback(chip, e)
-            chip._error = True
-
-
 def _check_logfile(chip, step, index, quiet=False, run_func=None):
     '''
     Check log file (must be after post-process)
@@ -1133,9 +563,19 @@ def _check_logfile(chip, step, index, quiet=False, run_func=None):
 def _executenode(chip, step, index, replay):
     workdir = chip.getworkdir(step=step, index=index)
     flow = chip.get('option', 'flow')
-    tool, _ = get_tool_task(chip, step, index, flow)
+    tool, task = get_tool_task(chip, step, index, flow)
 
-    _pre_process(chip, step, index)
+    task_class = chip.get("tool", tool, field="schema")
+    task_class.set_runtime(chip)
+
+    chip.logger.info(f'Running in {workdir}')
+
+    try:
+        task_class.pre_process()
+    except Exception as e:
+        chip.logger.error(f"Pre-processing failed for '{tool}/{task}'.")
+        utils.print_traceback(chip.logger, e)
+        raise e
 
     if chip.get('record', 'status', step=step, index=index) == NodeStatus.SKIPPED:
         # copy inputs to outputs and skip execution
@@ -1143,10 +583,15 @@ def _executenode(chip, step, index, replay):
 
         send_messages.send(chip, "skipped", step, index)
     else:
-        org_env = _set_env_vars(chip, step, index)
+        org_env = os.environ.copy()
+        os.environ.update(task_class.get_runtime_environmental_variables())
 
-        run_func = getattr(chip._get_task_module(step, index, flow=flow), 'run', None)
-        toolpath, version = _check_tool_version(chip, step, index, run_func)
+        toolpath = task_class.get_exe()
+        version = task_class.get_exe_version()
+
+        if not chip.get('option', 'novercheck', step=step, index=index):
+            if not task_class.check_exe_version(version):
+                _haltstep(chip, flow, step, index)
 
         if version:
             chip.schema.get("record", field='schema').record_tool(
@@ -1156,105 +601,50 @@ def _executenode(chip, step, index, replay):
             chip.schema.get("record", field='schema').record_tool(
                 step, index, toolpath, RecordTool.PATH)
 
-        # Write manifest (tool interface) (Don't move this!)
-        _write_task_manifest(chip, tool)
-
         send_messages.send(chip, "begin", step, index)
 
-        _run_executable_or_builtin(chip, step, index, version, toolpath, workdir, run_func)
+        try:
+            task_class.generate_replay_script(
+                os.path.join(workdir, "replay.sh"),
+                workdir)
+            ret_code = task_class.run_task(
+                workdir,
+                chip.get('option', 'quiet', step=step, index=index),
+                chip.get('option', 'loglevel', step=step, index=index),
+                chip.get('option', 'breakpoint', step=step, index=index),
+                chip.get('option', 'nice', step=step, index=index),
+                chip.get('option', 'timeout', step=step, index=index))
+        except Exception as e:
+            raise e
 
         os.environ.clear()
         os.environ.update(org_env)
 
-        _post_process(chip, step, index)
+        if ret_code != 0:
+            msg = f'Command failed with code {ret_code}.'
+            logfile = f"{step}.log"
+            if os.path.exists(logfile):
+                if chip.get('option', 'quiet', step=step, index=index):
+                    # Print last N lines of log when in quiet mode
+                    with sc_open(logfile) as logfd:
+                        loglines = logfd.read().splitlines()
+                        for logline in loglines[-_failed_log_lines:]:
+                            chip.logger.error(logline)
+                    # No log file for pure-Python tools.
+                msg += f' See log file {os.path.abspath(logfile)}'
+            chip.logger.warning(msg)
+            chip._error = True
+
+        try:
+            task_class.post_process()
+        except Exception as e:
+            chip.logger.error(f"Post-processing failed for '{tool}/{task}'.")
+            utils.print_traceback(chip.logger, e)
+            chip._error = True
 
     _finalizenode(chip, step, index, replay)
 
     send_messages.send(chip, "end", step, index)
-
-
-def _pre_process(chip, step, index):
-    flow = chip.get('option', 'flow')
-    tool, task = get_tool_task(chip, step, index, flow)
-    func = getattr(chip._get_task_module(step, index, flow=flow), 'pre_process', None)
-    if func:
-        try:
-            if _do_record_access():
-                chip.schema.add_journaling_type("get")
-            func(chip)
-            chip.schema.remove_journaling_type("get")
-        except Exception as e:
-            chip.logger.error(f"Pre-processing failed for '{tool}/{task}'.")
-            raise e
-        if chip._error:
-            chip.logger.error(f"Pre-processing failed for '{tool}/{task}'")
-            _haltstep(chip, flow, step, index)
-
-
-def _set_env_vars(chip, step, index):
-    org_env = os.environ.copy()
-
-    tool, task = get_tool_task(chip, step, index)
-
-    if _do_record_access():
-        chip.schema.add_journaling_type("get")
-    os.environ.update(_get_run_env_vars(chip, tool, task, step, index, include_path=True))
-    chip.schema.remove_journaling_type("get")
-
-    return org_env
-
-
-def _check_tool_version(chip, step, index, run_func=None):
-    '''
-    Check exe version
-    '''
-
-    flow = chip.get('option', 'flow')
-    tool, task = get_tool_task(chip, step, index, flow)
-
-    vercheck = not chip.get('option', 'novercheck', step=step, index=index)
-    veropt = chip.get('tool', tool, 'vswitch')
-    exe = _getexe(chip, tool, step, index)
-    version = None
-    if exe is not None:
-        exe_path, exe_base = os.path.split(exe)
-        if veropt:
-            cmdlist = [exe]
-            cmdlist.extend(veropt)
-            proc = subprocess.run(cmdlist,
-                                  stdin=subprocess.DEVNULL,
-                                  stdout=subprocess.PIPE,
-                                  stderr=subprocess.STDOUT,
-                                  universal_newlines=True)
-            if proc.returncode != 0:
-                chip.logger.warning(f'Version check on {tool} failed with '
-                                    f'code {proc.returncode}')
-
-            parse_version = getattr(chip._get_tool_module(step, index, flow=flow),
-                                    'parse_version',
-                                    None)
-            if parse_version is None:
-                chip.logger.error(f'{tool}/{task} does not implement parse_version().')
-                _haltstep(chip, flow, step, index)
-            try:
-                version = parse_version(proc.stdout)
-            except Exception as e:
-                chip.logger.error(f'{tool} failed to parse version string: {proc.stdout}')
-                raise e
-
-            chip.logger.info(f"Tool '{exe_base}' found with version '{version}' "
-                             f"in directory '{exe_path}'")
-            if vercheck and not _check_version(chip, version, tool, step, index):
-                if proc.returncode != 0:
-                    chip.logger.error(f"Tool '{exe_base}' responded with: {proc.stdout}")
-                _haltstep(chip, flow, step, index)
-        else:
-            chip.logger.info(f"Tool '{exe_base}' found in directory '{exe_path}'")
-    elif run_func is None:
-        exe_base = chip.get('tool', tool, 'exe')
-        chip.logger.error(f'Executable {exe_base} not found')
-        _haltstep(chip, flow, step, index)
-    return (exe, version)
 
 
 def _hash_files(chip, step, index, setup=False):
@@ -1303,12 +693,11 @@ def _finalizenode(chip, step, index, replay):
         chip.get('option', 'quiet', step=step, index=index) and not
         chip.get('option', 'breakpoint', step=step, index=index)
     )
-    run_func = getattr(chip._get_task_module(step, index, flow=flow), 'run', None)
 
     is_skipped = chip.get('record', 'status', step=step, index=index) == NodeStatus.SKIPPED
 
     if not is_skipped:
-        _check_logfile(chip, step, index, quiet, run_func)
+        _check_logfile(chip, step, index, quiet, None)
 
     # Report metrics
     for metric in ['errors', 'warnings']:
@@ -1450,12 +839,6 @@ def assert_required_accesses(chip, step, index):
     for key in chip.getkeys('tool', tool, 'task', task, 'report'):
         exempt.append(('tool', tool, 'task', task, 'report', key))
 
-    # Get exempted keys from task
-    func = getattr(chip._get_task_module(step, index, flow=flow), 'exempt_keys', None)
-    if func:
-        # No need for try / except since this must work properly
-        exempt.extend(func(chip))
-
     required = set(
         [tuple(key.split(',')) for key in chip.get('tool', tool, 'task', task, 'require',
                                                    step=step, index=index)])
@@ -1539,238 +922,6 @@ def _reset_flow_nodes(chip, flow, nodes_to_execute):
                     clear_node(step, index)
 
 
-def _prepare_nodes(chip, nodes_to_run, processes, local_processes, flow):
-    '''
-    For each node to run, prepare a process and store its dependencies
-    '''
-
-    # Call this in case this was invoked without __main__
-    multiprocessing.freeze_support()
-
-    # Log queue for logging messages
-    log_queue = multiprocessing.Queue(-1)
-
-    flow_schema = chip.schema.get("flowgraph", flow, field="schema")
-    runtime = RuntimeFlowgraph(
-        flow_schema,
-        from_steps=set([step for step, _ in flow_schema.get_entry_nodes()]),
-        prune_nodes=chip.get('option', 'prune'))
-
-    init_funcs = set()
-    runtime_flow = RuntimeFlowgraph(
-        chip.schema.get("flowgraph", flow, field='schema'),
-        from_steps=chip.get('option', 'from'),
-        to_steps=chip.get('option', 'to'),
-        prune_nodes=chip.get('option', 'prune'))
-    for (step, index) in runtime_flow.get_nodes():
-        node = (step, index)
-
-        if chip.get('record', 'status', step=step, index=index) != NodeStatus.PENDING:
-            continue
-
-        nodes_to_run[node] = runtime.get_node_inputs(
-            step, index,
-            record=chip.schema.get("record", field="schema"))
-
-        exec_func = _executenode
-
-        if chip.get('option', 'scheduler', 'name', step=step, index=index) == 'slurm':
-            # Defer job to compute node
-            # If the job is configured to run on a cluster, collect the schema
-            # and send it to a compute node for deferred execution.
-            init_funcs.add(slurm.init)
-            exec_func = slurm._defernode
-        elif chip.get('option', 'scheduler', 'name', step=step, index=index) == 'docker':
-            # Run job in docker
-            init_funcs.add(docker_runner.init)
-            exec_func = docker_runner.run
-            local_processes.append((step, index))
-        else:
-            local_processes.append((step, index))
-
-        process = {
-            "child_pipe": None,
-            "parent_pipe": None,
-            "proc": None
-        }
-        process["parent_pipe"], process["child_pipe"] = multiprocessing.Pipe()
-        process["proc"] = multiprocessing.Process(
-            target=_runtask,
-            args=(chip, flow, step, index, exec_func),
-            kwargs={"pipe": process["child_pipe"],
-                    "queue": log_queue})
-
-        processes[node] = process
-
-    for init_func in init_funcs:
-        init_func(chip)
-
-    return log_queue
-
-
-def _check_node_dependencies(chip, node, deps, deps_was_successful):
-    had_deps = len(deps) > 0
-    step, index = node
-    tool, _ = get_tool_task(chip, step, index)
-
-    # Clear any nodes that have finished from dependency list.
-    for in_step, in_index in list(deps):
-        in_status = chip.get('record', 'status', step=in_step, index=in_index)
-        if NodeStatus.is_done(in_status):
-            deps.remove((in_step, in_index))
-        if in_status == NodeStatus.SUCCESS:
-            deps_was_successful[node] = True
-        if NodeStatus.is_error(in_status):
-            # Fail if any dependency failed for non-builtin task
-            if tool != 'builtin':
-                deps.clear()
-                chip.schema.get("record", field='schema').set('status', NodeStatus.ERROR,
-                                                              step=step, index=index)
-                return
-
-    # Fail if no dependency successfully finished for builtin task
-    if had_deps and len(deps) == 0 \
-            and tool == 'builtin' and not deps_was_successful.get(node):
-        chip.schema.get("record", field='schema').set('status', NodeStatus.ERROR,
-                                                      step=step, index=index)
-
-
-def _launch_nodes(chip, nodes_to_run, processes, local_processes):
-    running_nodes = {}
-    max_parallel_run = chip.get('option', 'scheduler', 'maxnodes')
-    max_cores = utils.get_cores(chip)
-    max_threads = utils.get_cores(chip)
-    if not max_parallel_run:
-        max_parallel_run = utils.get_cores(chip)
-
-    # clip max parallel jobs to 1 <= jobs <= max_cores
-    max_parallel_run = max(1, min(max_parallel_run, max_cores))
-
-    def allow_start(node):
-        if node not in local_processes:
-            # using a different scheduler, so allow
-            return True, 0
-
-        if len(running_nodes) >= max_parallel_run:
-            return False, 0
-
-        # Record thread count requested
-        step, index = node
-        tool, task = get_tool_task(chip, step, index)
-        requested_threads = chip.get('tool', tool, 'task', task, 'threads',
-                                     step=step, index=index)
-        if not requested_threads:
-            # not specified, marking it max to be safe
-            requested_threads = max_threads
-        # clamp to max_parallel to avoid getting locked up
-        requested_threads = max(1, min(requested_threads, max_threads))
-
-        if requested_threads + sum(running_nodes.values()) > max_cores:
-            # delay until there are enough core available
-            return False, 0
-
-        # allow and record how many threads to associate
-        return True, requested_threads
-
-    deps_was_successful = {}
-
-    if _get_callback('pre_run'):
-        _get_callback('pre_run')(chip)
-
-    start_times = {None: time.time()}
-
-    while len(nodes_to_run) > 0 or len(running_nodes) > 0:
-        changed = _process_completed_nodes(chip, processes, running_nodes)
-
-        # Check for new nodes that can be launched.
-        for node, deps in list(nodes_to_run.items()):
-            # TODO: breakpoint logic:
-            # if node is breakpoint, then don't launch while len(running_nodes) > 0
-
-            _check_node_dependencies(chip, node, deps, deps_was_successful)
-
-            if chip.get('record', 'status', step=node[0], index=node[1]) == NodeStatus.ERROR:
-                del nodes_to_run[node]
-                continue
-
-            # If there are no dependencies left, launch this node and
-            # remove from nodes_to_run.
-            if len(deps) == 0:
-                dostart, requested_threads = allow_start(node)
-
-                if dostart:
-                    if _get_callback('pre_node'):
-                        _get_callback('pre_node')(chip, *node)
-
-                    chip.schema.get("record", field='schema').set('status', NodeStatus.RUNNING,
-                                                                  step=node[0], index=node[1])
-                    start_times[node] = time.time()
-                    changed = True
-
-                    processes[node]["proc"].start()
-                    del nodes_to_run[node]
-                    running_nodes[node] = requested_threads
-
-        # Check for situation where we have stuff left to run but don't
-        # have any nodes running. This shouldn't happen, but we will get
-        # stuck in an infinite loop if it does, so we want to break out
-        # with an explicit error.
-        if len(nodes_to_run) > 0 and len(running_nodes) == 0:
-            raise SiliconCompilerError(
-                'Nodes left to run, but no running nodes. From/to may be invalid.', chip=chip)
-
-        if chip._dash and changed:
-            # Update dashboard if the manifest changed
-            chip._dash.update_manifest(payload={"starttimes": start_times})
-
-        if len(running_nodes) == 1:
-            # if there is only one node running, just join the thread
-            running_node = list(running_nodes.keys())[0]
-            processes[running_node]["proc"].join()
-        elif len(running_nodes) > 1:
-            # if there are more than 1, join the first with a timeout
-            running_node = list(running_nodes.keys())[0]
-            processes[running_node]["proc"].join(timeout=0.1)
-
-
-def _process_completed_nodes(chip, processes, running_nodes):
-    changed = False
-    for node in list(running_nodes.keys()):
-        if not processes[node]["proc"].is_alive():
-            step, index = node
-            manifest = os.path.join(chip.getworkdir(step=step, index=index),
-                                    'outputs',
-                                    f'{chip.design}.pkg.json')
-            chip.logger.debug(f'{step}{index} is complete merging: {manifest}')
-            if os.path.exists(manifest):
-                JournalingSchema(chip.schema).read_journal(manifest)
-
-            if processes[node]["parent_pipe"] and processes[node]["parent_pipe"].poll(1):
-                try:
-                    packages = processes[node]["parent_pipe"].recv()
-                    if isinstance(packages, dict):
-                        chip._packages.update(packages)
-                except:  # noqa E722
-                    pass
-
-            del running_nodes[node]
-            if processes[node]["proc"].exitcode > 0:
-                status = NodeStatus.ERROR
-            else:
-                status = chip.get('record', 'status', step=step, index=index)
-                if not status or status == NodeStatus.PENDING:
-                    status = NodeStatus.ERROR
-
-            chip.schema.get("record", field='schema').set('status', status, step=step, index=index)
-
-            changed = True
-
-            if _get_callback('post_node'):
-                _get_callback('post_node')(chip, *node)
-
-    return changed
-
-
 def _check_nodes_status(chip, flow):
     flowgraph = chip.schema.get("flowgraph", flow, field="schema")
     runtime = RuntimeFlowgraph(
@@ -1793,28 +944,6 @@ def _check_nodes_status(chip, flow):
     if unreached:
         raise SiliconCompilerError(
             f'These final steps could not be reached: {",".join(sorted(unreached))}', chip=chip)
-
-
-def print_traceback(chip, exception):
-    chip.logger.error(f'{exception}')
-    trace = StringIO()
-    traceback.print_tb(exception.__traceback__, file=trace)
-    chip.logger.error("Backtrace:")
-    for line in trace.getvalue().splitlines():
-        chip.logger.error(line)
-
-
-def kill_process(chip, proc, tool, poll_interval, msg=""):
-    TERMINATE_TIMEOUT = 5
-    interrupt_time = time.time()
-    chip.logger.info(f'{msg}Waiting for {tool} to exit...')
-    while proc.poll() is None and \
-            (time.time() - interrupt_time) < TERMINATE_TIMEOUT:
-        time.sleep(5 * poll_interval)
-    if proc.poll() is None:
-        chip.logger.warning(f'{tool} did not exit within {TERMINATE_TIMEOUT} '
-                            'seconds. Terminating...')
-        utils.terminate_process(proc.pid)
 
 
 def get_check_node_keys(chip, step, index):
@@ -2098,6 +1227,9 @@ def copy_old_run_dir(chip, org_jobname):
 
     # Modify manifests to correct jobname
     for step, index in copy_nodes:
+        tool, _ = get_tool_task(chip, step, index)
+        task_class = chip.get("tool", tool, field="schema")
+
         # rewrite replay files
         replay_file = f'{chip.getworkdir(step=step, index=index)}/replay.sh'
         if os.path.exists(replay_file):
@@ -2105,8 +1237,9 @@ def copy_old_run_dir(chip, org_jobname):
             os.remove(replay_file)
             chip.set('arg', 'step', step)
             chip.set('arg', 'index', index)
-            tool, task = get_tool_task(chip, step, index)
-            _makecmd(chip, tool, task, step, index, script_name=replay_file)
+            task_class.set_runtime(chip, step=step, index=index)
+            task_class.generate_replay_script(replay_file, chip.getworkdir(step=step, index=index))
+            task_class.set_runtime(None)
             chip.unset('arg', 'step')
             chip.unset('arg', 'index')
 
